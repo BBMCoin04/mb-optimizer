@@ -9,6 +9,9 @@ python -m PyInstaller `
   --clean `
   --onefile `
   --windowed `
+  --icon "src\mb_optimizer\resources\app.ico" `
+  --add-data "src\mb_optimizer\resources\app.png;mb_optimizer\resources" `
+  --add-data "src\mb_optimizer\resources\app.ico;mb_optimizer\resources" `
   --name "MB-CF-Optimizer-windows-x64" `
   app.py
 

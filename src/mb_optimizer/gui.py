@@ -5,12 +5,22 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QElapsedTimer,
+    QObject,
+    QSettings,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -25,6 +35,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QStyle,
     QTableWidget,
     QTableWidgetItem,
@@ -34,6 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .endpoints import DEFAULT_TEST_URL, TEST_URL_PRESETS
 from .models import AggregatedResult, OptimizationOptions
 from .optimizer import OptimizationService
 from .runner import CfstCancelled
@@ -124,6 +136,13 @@ class MainWindow(QMainWindow):
         self.update_thread: QThread | None = None
         self.update_worker: QObject | None = None
         self.pending_update_info: UpdateInfo | None = None
+        self.current_status_message = "就绪"
+        self.run_clock = QElapsedTimer()
+        self.elapsed_tick = QTimer(self)
+        self.elapsed_tick.setInterval(1000)
+        self.elapsed_tick.timeout.connect(self._refresh_elapsed_status)
+        self.log_expanded = False
+        self.previous_splitter_sizes = [500, 180]
 
         self.setWindowTitle(f"MB CF Optimizer {__version__}")
         self.setMinimumSize(940, 680)
@@ -197,13 +216,21 @@ class MainWindow(QMainWindow):
         form.addWidget(self.port_input, 0, 3)
 
         form.addWidget(QLabel("测速地址"), 1, 0)
-        self.url_input = QLineEdit("https://cf.xiu2.xyz/url")
-        self.url_input.setClearButtonEnabled(True)
+        self.url_input = QComboBox()
+        self.url_input.setEditable(True)
+        self.url_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for label, url in TEST_URL_PRESETS:
+            self.url_input.addItem(label, url)
+        self.url_input.setEditText(DEFAULT_TEST_URL)
+        self.url_input.lineEdit().setClearButtonEnabled(True)
+        self.url_input.activated.connect(
+            lambda index: self.url_input.setEditText(self.url_input.itemData(index))
+        )
         form.addWidget(self.url_input, 1, 1, 1, 3)
 
         form.addWidget(QLabel("候选 IP"), 2, 0)
         source_box = QHBoxLayout()
-        self.source_input = QLineEdit("使用 CFST 内置网段")
+        self.source_input = QLineEdit("Cloudflare 官方网段（自动更新）")
         self.source_input.setReadOnly(True)
         self.browse_button = QPushButton()
         self.browse_button.setIcon(
@@ -215,7 +242,7 @@ class MainWindow(QMainWindow):
         self.clear_source_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton)
         )
-        self.clear_source_button.setToolTip("恢复使用内置网段")
+        self.clear_source_button.setToolTip("恢复使用自动更新的官方网段")
         self.clear_source_button.setEnabled(False)
         self.clear_source_button.clicked.connect(self._clear_ip_file)
         source_box.addWidget(self.source_input)
@@ -242,20 +269,21 @@ class MainWindow(QMainWindow):
         self.latency_input = QSpinBox()
         self.latency_input.setRange(50, 2000)
         self.latency_input.setSuffix(" ms")
-        self.latency_input.setValue(300)
+        self.latency_input.setValue(1000)
         filter_layout.addWidget(self.latency_input, 0, 1)
         filter_layout.addWidget(QLabel("丢包上限"), 0, 2)
         self.loss_input = QDoubleSpinBox()
         self.loss_input.setRange(0, 100)
         self.loss_input.setSuffix(" %")
         self.loss_input.setDecimals(0)
-        self.loss_input.setValue(20)
+        self.loss_input.setValue(100)
         filter_layout.addWidget(self.loss_input, 0, 3)
-        filter_layout.addWidget(QLabel("复测候选"), 0, 4)
-        self.candidate_input = QSpinBox()
-        self.candidate_input.setRange(3, 30)
-        self.candidate_input.setValue(10)
-        filter_layout.addWidget(self.candidate_input, 0, 5)
+        filter_layout.addWidget(QLabel("广筛数量"), 0, 4)
+        self.broad_count_input = QSpinBox()
+        self.broad_count_input.setRange(100, 5000)
+        self.broad_count_input.setSingleStep(100)
+        self.broad_count_input.setValue(800)
+        filter_layout.addWidget(self.broad_count_input, 0, 5)
         filter_layout.setColumnStretch(6, 1)
         self.filter_frame.setVisible(False)
         panel_layout.addWidget(self.filter_frame)
@@ -323,6 +351,9 @@ class MainWindow(QMainWindow):
         self.summary.setVisible(False)
         root.addWidget(self.summary)
 
+        self.content_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.content_splitter.setChildrenCollapsible(True)
+
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             ["推荐", "IP", "地区", "成功率", "丢包", "速度 MB/s", "延迟 ms", "波动 ms"]
@@ -337,35 +368,56 @@ class MainWindow(QMainWindow):
         header_view.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.doubleClicked.connect(self._copy_selected)
-        root.addWidget(self.table, 1)
+        self.content_splitter.addWidget(self.table)
 
+        log_panel = QWidget()
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(6)
+        log_header = QHBoxLayout()
         self.log_toggle = QToolButton()
         self.log_toggle.setText("运行日志")
         self.log_toggle.setCheckable(True)
         self.log_toggle.setArrowType(Qt.ArrowType.RightArrow)
         self.log_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.log_toggle.toggled.connect(self._toggle_log)
-        root.addWidget(self.log_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.expand_log_button = QPushButton()
+        self.expand_log_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton)
+        )
+        self.expand_log_button.setToolTip("放大或恢复日志区域")
+        self.expand_log_button.setEnabled(False)
+        self.expand_log_button.clicked.connect(self._toggle_log_expanded)
+        log_header.addWidget(self.log_toggle)
+        log_header.addStretch()
+        log_header.addWidget(self.expand_log_button)
+        log_layout.addLayout(log_header)
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumBlockCount(500)
-        self.log_output.setFixedHeight(130)
+        self.log_output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.log_output.setMinimumHeight(100)
         self.log_output.setVisible(False)
-        root.addWidget(self.log_output)
+        log_layout.addWidget(self.log_output, 1)
+        self.content_splitter.addWidget(log_panel)
+        self.content_splitter.setStretchFactor(0, 4)
+        self.content_splitter.setStretchFactor(1, 1)
+        self.content_splitter.setSizes([520, 36])
+        root.addWidget(self.content_splitter, 1)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background: #f4f6f8; color: #18212b; }
+            QMainWindow, QWidget { background: #e9eff1; color: #18212b; }
             QLabel#title { font-size: 22px; font-weight: 700; color: #111827; }
             QLabel#muted { color: #667085; }
             QLabel#status { color: #344054; font-weight: 600; }
-            QFrame#panel { background: #ffffff; border: 1px solid #d8dee6; border-radius: 6px; }
+            QFrame#panel { background: #f6f9f9; border: 1px solid #cbd6da; border-radius: 6px; }
             QFrame#summary { background: #eef8f4; border: 1px solid #9bd5c3; border-radius: 6px; }
             QLabel#summaryCaption { color: #08785e; font-weight: 700; }
             QLabel#bestIp { font-size: 16px; font-weight: 700; color: #12382f; }
-            QPushButton, QToolButton { min-height: 32px; padding: 0 12px; background: #ffffff; border: 1px solid #cbd3dc; border-radius: 5px; }
-            QPushButton:hover, QToolButton:hover { background: #f8fafc; border-color: #98a5b3; }
+            QPushButton, QToolButton { min-height: 32px; padding: 0 12px; background: #f5f8f8; border: 1px solid #bcc9ce; border-radius: 5px; }
+            QPushButton:hover, QToolButton:hover { background: #edf3f4; border-color: #8fa1a8; }
             QPushButton:disabled { color: #98a2b3; background: #eef1f4; border-color: #d8dee6; }
             QPushButton#primary { color: #ffffff; background: #0f766e; border-color: #0f766e; font-weight: 700; min-width: 112px; }
             QPushButton#primary:hover { background: #0b665f; }
@@ -373,34 +425,50 @@ class MainWindow(QMainWindow):
             QPushButton#segment { border-radius: 0; min-height: 30px; }
             QPushButton#segment:first { border-top-left-radius: 5px; border-bottom-left-radius: 5px; }
             QPushButton#segment:checked { color: #ffffff; background: #344054; border-color: #344054; }
-            QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 32px; background: #ffffff; border: 1px solid #cbd3dc; border-radius: 4px; padding: 0 8px; }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #2f80a3; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 32px; background: #fbfcfc; border: 1px solid #bcc9ce; border-radius: 4px; padding: 0 8px; }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #2f80a3; }
+            QComboBox QAbstractItemView { background: #fbfcfc; border: 1px solid #bcc9ce; selection-background-color: #dcecef; }
             QProgressBar { height: 8px; background: #dfe5eb; border: 0; border-radius: 4px; }
             QProgressBar::chunk { background: #159a80; border-radius: 4px; }
-            QTableWidget { background: #ffffff; alternate-background-color: #f8fafb; border: 1px solid #d8dee6; border-radius: 4px; gridline-color: #e6eaf0; selection-background-color: #dcecf3; selection-color: #18212b; }
-            QHeaderView::section { background: #eef1f4; color: #344054; padding: 8px; border: 0; border-right: 1px solid #d8dee6; font-weight: 600; }
+            QTableWidget { background: #f7f9fa; alternate-background-color: #edf2f3; border: 1px solid #cbd6da; border-radius: 4px; gridline-color: #dce4e7; selection-background-color: #d4e7eb; selection-color: #18212b; }
+            QHeaderView::section { background: #dfe8ea; color: #344054; padding: 8px; border: 0; border-right: 1px solid #cbd6da; font-weight: 600; }
+            QSplitter::handle { background: #c5d1d5; height: 5px; }
             QPlainTextEdit { background: #151b22; color: #d6dde5; border: 1px solid #303944; border-radius: 4px; padding: 8px; font-family: Consolas; }
             """
         )
 
     def _load_settings(self) -> None:
-        self.url_input.setText(
-            self.settings.value("test_url", self.url_input.text(), str)
-        )
+        schema = self.settings.value("settings_schema", 0, int)
         self.port_input.setValue(self.settings.value("port", 443, int))
-        self.latency_input.setValue(self.settings.value("max_latency", 300, int))
-        self.loss_input.setValue(self.settings.value("max_loss_percent", 20, float))
-        self.candidate_input.setValue(self.settings.value("candidate_count", 10, int))
+        if schema >= 2:
+            self.url_input.setEditText(
+                self.settings.value("test_url", DEFAULT_TEST_URL, str)
+            )
+            self.latency_input.setValue(self.settings.value("max_latency", 1000, int))
+            self.loss_input.setValue(
+                self.settings.value("max_loss_percent", 100, float)
+            )
+            self.broad_count_input.setValue(
+                self.settings.value("broad_candidate_count", 800, int)
+            )
         if self.settings.value("ipv6", False, bool):
             self.ipv6_button.setChecked(True)
 
     def _save_settings(self) -> None:
-        self.settings.setValue("test_url", self.url_input.text().strip())
+        self.settings.setValue("settings_schema", 2)
+        self.settings.setValue("test_url", self.url_input.currentText().strip())
         self.settings.setValue("port", self.port_input.value())
         self.settings.setValue("max_latency", self.latency_input.value())
         self.settings.setValue("max_loss_percent", self.loss_input.value())
-        self.settings.setValue("candidate_count", self.candidate_input.value())
+        self.settings.setValue("broad_candidate_count", self.broad_count_input.value())
         self.settings.setValue("ipv6", self.ipv6_button.isChecked())
+        if self.log_output.isVisible():
+            height = (
+                self.previous_splitter_sizes[1]
+                if self.log_expanded
+                else self.content_splitter.sizes()[1]
+            )
+            self.settings.setValue("log_height", height)
 
     def _toggle_filters(self, visible: bool) -> None:
         self.filter_frame.setVisible(visible)
@@ -410,9 +478,29 @@ class MainWindow(QMainWindow):
 
     def _toggle_log(self, visible: bool) -> None:
         self.log_output.setVisible(visible)
+        self.expand_log_button.setEnabled(visible)
         self.log_toggle.setArrowType(
             Qt.ArrowType.DownArrow if visible else Qt.ArrowType.RightArrow
         )
+        if visible:
+            height = self.settings.value("log_height", 180, int)
+            self.content_splitter.setSizes([max(240, self.height() - height), height])
+        else:
+            self.log_expanded = False
+            self.content_splitter.setSizes([1, 36])
+
+    def _toggle_log_expanded(self) -> None:
+        if not self.log_output.isVisible():
+            return
+        if self.log_expanded:
+            self.content_splitter.setSizes(self.previous_splitter_sizes)
+            icon = QStyle.StandardPixmap.SP_TitleBarMaxButton
+        else:
+            self.previous_splitter_sizes = self.content_splitter.sizes()
+            self.content_splitter.setSizes([0, 1])
+            icon = QStyle.StandardPixmap.SP_TitleBarNormalButton
+        self.log_expanded = not self.log_expanded
+        self.expand_log_button.setIcon(self.style().standardIcon(icon))
 
     def _browse_ip_file(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -425,16 +513,16 @@ class MainWindow(QMainWindow):
 
     def _clear_ip_file(self) -> None:
         self.custom_ip_file = None
-        self.source_input.setText("使用 CFST 内置网段")
+        self.source_input.setText("Cloudflare 官方网段（自动更新）")
         self.clear_source_button.setEnabled(False)
 
     def _options(self) -> OptimizationOptions:
         return OptimizationOptions(
             ipv6=self.ipv6_button.isChecked(),
             port=self.port_input.value(),
-            test_url=self.url_input.text().strip(),
+            test_url=self.url_input.currentText().strip(),
             custom_ip_file=self.custom_ip_file,
-            candidate_count=self.candidate_input.value(),
+            broad_candidate_count=self.broad_count_input.value(),
             max_latency_ms=self.latency_input.value(),
             max_loss_rate=self.loss_input.value() / 100,
         )
@@ -454,6 +542,8 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.summary.setVisible(False)
         self.log_output.clear()
+        if not self.log_toggle.isChecked():
+            self.log_toggle.setChecked(True)
         self.progress.setValue(0)
         self._set_running(True)
 
@@ -477,14 +567,25 @@ class MainWindow(QMainWindow):
 
     def _stop_optimization(self) -> None:
         if self.optimize_worker:
-            self.status_label.setText("正在停止")
+            self.current_status_message = "正在停止"
+            self._refresh_elapsed_status()
             self.stop_button.setEnabled(False)
             self.optimize_worker.cancel()
 
     @Slot(str, int)
     def _set_status(self, message: str, progress: int) -> None:
-        self.status_label.setText(message)
+        self.current_status_message = message
+        self._refresh_elapsed_status()
         self.progress.setValue(progress)
+
+    def _refresh_elapsed_status(self) -> None:
+        if self.elapsed_tick.isActive() and self.run_clock.isValid():
+            seconds = self.run_clock.elapsed() // 1000
+            self.status_label.setText(
+                f"{self.current_status_message} · 已用 {seconds // 60:02d}:{seconds % 60:02d}"
+            )
+        else:
+            self.status_label.setText(self.current_status_message)
 
     @Slot(object)
     def _optimization_finished(self, results: object) -> None:
@@ -494,15 +595,17 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _optimization_failed(self, message: str) -> None:
-        self.status_label.setText("优选失败")
+        self.current_status_message = "优选失败"
         self._set_running(False)
+        self._refresh_elapsed_status()
         QMessageBox.critical(self, "优选失败", message)
 
     @Slot()
     def _optimization_cancelled(self) -> None:
-        self.status_label.setText("已停止")
+        self.current_status_message = "已停止"
         self.progress.setValue(0)
         self._set_running(False)
+        self._refresh_elapsed_status()
 
     @Slot()
     def _optimization_thread_finished(self) -> None:
@@ -512,6 +615,13 @@ class MainWindow(QMainWindow):
         self.optimize_worker = None
 
     def _set_running(self, running: bool) -> None:
+        if running:
+            self.current_status_message = "准备开始"
+            self.run_clock.start()
+            self.elapsed_tick.start()
+            self._refresh_elapsed_status()
+        else:
+            self.elapsed_tick.stop()
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.update_button.setEnabled(not running)
@@ -525,7 +635,7 @@ class MainWindow(QMainWindow):
             self.clear_source_button,
             self.latency_input,
             self.loss_input,
-            self.candidate_input,
+            self.broad_count_input,
         ):
             widget.setEnabled(not running)
 

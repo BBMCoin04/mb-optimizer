@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mb-cf-optimizer"
-version = "0.1.0"
+version = "0.2.0"
 description = "A focused local Cloudflare IP optimizer for Windows"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,9 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mb_optimizer = ["resources/*.png", "resources/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,101 +1,129 @@
 # MB CF Optimizer
 
-一个只做一件事的 Windows 本地工具：从当前网络环境中筛选稳定、快速的 Cloudflare IP。
+一个专注于本地 Cloudflare IP 优选的 Windows 桌面工具。
 
-## 工作方式
+程序使用官方 [XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) 作为独立测速引擎，不上传结果，也不修改系统或代理配置。
 
-1. 使用官方 [XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) 做第一轮广泛筛选。
-2. 选取速度较好的前 10 个候选地址。
-3. 对候选地址连续复测 3 轮。
-4. 按多轮成功率、丢包率、下载速度中位数、延迟中位数和延迟波动排序。
-5. 给出一个首选和最多三个备用地址。
+## 当前流程
 
-测速结果只保存在当前界面中，可按需导出 CSV。程序不上传结果，也不修改系统或代理配置。
+1. 首次运行时下载并校验固定版本的 CFST 引擎。
+2. 每 7 天尝试从 Cloudflare 官方地址更新 IPv4/IPv6 网段。
+3. 更新失败时使用上次缓存；没有缓存时使用 CFST 内置列表。
+4. 从网段中随机抽取 800 个精确 IP，只做延迟广筛。
+5. 让延迟与丢包较好的前 10 个进入下载测速。
+6. 选出前 3 个，再复测 2 轮。
+7. 按成功率、丢包、速度中位数、延迟中位数和波动排序。
 
-## 使用
+相较于 0.1.0，这个流程避免对数千地址直接下载测速，明显缩短耗时并减少流量。
 
-从仓库的 [Releases](https://github.com/BBMCoin04/mb-optimizer/releases) 下载 `MB-CF-Optimizer-windows-x64.exe` 并直接运行。
+## 下载和运行
 
-首次开始优选时，程序会从官方 GitHub Release 下载固定版本的 CFST 引擎。当前固定版本为 `v2.3.5`，下载后会验证上游公布的 SHA-256；校验失败时不会执行。
+从仓库的 [Releases](https://github.com/BBMCoin04/mb-optimizer/releases) 下载：
 
-默认设置适合大多数 Cloudflare HTTPS 场景：
+```text
+MB-CF-Optimizer-windows-x64.exe
+```
+
+直接运行即可。首次点击“开始优选”需要联网下载 CFST `v2.3.5`，程序会验证上游公布的 SHA-256。
+
+## 默认配置
 
 - IPv4
 - 端口 `443`
-- 延迟上限 `300 ms`
-- 丢包上限 `20%`
-- 10 个候选、3 轮复测
+- 延迟上限 `1000 ms`
+- 丢包上限 `100%`，用于宽松广筛
+- 广筛候选 `800`
+- 下载短名单 `10`
+- 最终复测 `3`
+- 额外复测 `2` 轮
 
-测速地址决定下载测速的实际目标。需要评估自己的 Cloudflare 业务时，应换成由对应 CDN 提供、可直接下载且足够大的 HTTPS 文件。
+广筛宽松不代表最终结果宽松。下载失败和多轮不稳定的地址会在后续阶段被淘汰。
 
-## 自定义候选
+## 测速地址
 
-“候选 IP”旁的文件按钮可选择文本文件。每行填写一个 IP 或 CIDR，例如：
+测速地址使用可编辑下拉框，当前预设：
 
 ```text
-104.16.0.0/13
-172.64.0.0/13
-2606:4700::/32
+Cloudflare 镜像（推荐）
+https://cloudflaremirrors.com/archlinux/iso/latest/archlinux-x86_64.iso
+
+Cloudflare 官方测速
+https://speed.cloudflare.com/__down?bytes=250000000
+```
+
+程序开始前会以最多 64 KB 的流式读取验证地址，不会在预检时下载完整文件。首选地址失败时会尝试备用地址；所有地址失败时给出明确错误。
+
+## 官方 IP 更新与回退
+
+优先来源：
+
+```text
+https://www.cloudflare.com/ips-v4/
+https://www.cloudflare.com/ips-v6/
+```
+
+回退顺序：
+
+```text
+Cloudflare 官方地址
+        ↓
+7 天内的本地缓存
+        ↓
+过期但格式有效的本地缓存
+        ↓
+CFST 安装包内置列表
+```
+
+缓存位置：
+
+```text
+%LOCALAPPDATA%\MB-CF-Optimizer\ip-lists\
+```
+
+第三方反代 IP 不会作为默认候选。可通过候选 IP 文件按钮自行导入 IP 或 CIDR 文本。
+
+## 网络要求
+
+优选时应让测速电脑直连网络。OpenClash、PassWall、Mihomo TUN 等透明代理可能在局域网内接管 TCP 连接，产生异常低延迟和无效结果。
+
+若延迟中位数低于 `5 ms`，程序会在日志中提示可能存在透明代理。
+
+## 本地源码运行
+
+推荐 Python 3.12，也支持项目依赖可安装的 Python 3.11 以上版本。
+
+```powershell
+cd D:\Projects\Code\mb-optimizer
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe app.py
+```
+
+需要测试和打包工具时：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest
+.\scripts\build_windows.ps1
 ```
 
 ## 应用更新
 
-“检查更新”按钮读取本仓库最新 GitHub Release。正式打包版本会：
+“检查更新”读取本仓库最新 GitHub Release。正式打包版会：
 
-1. 下载 `MB-CF-Optimizer-windows-x64.exe`；
-2. 下载配套 `.sha256` 文件并校验；
-3. 退出当前程序；
-4. 替换原 EXE 并自动重启。
+1. 下载新的 Windows EXE；
+2. 下载配套 `.sha256`；
+3. 校验文件；
+4. 退出当前程序；
+5. 替换原 EXE 并自动重启。
 
-源码运行模式不会覆盖开发目录，只会打开 Release 页面。
+源码运行模式只会打开 Release 页面，不会覆盖开发目录。
 
-## 本地开发
+## 项目说明
 
-要求 Python 3.11 或更高版本。Windows PowerShell：
+完整结构、模块职责、稳定性设计和版本演进记录见：
 
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-python app.py
-```
-
-运行测试：
-
-```powershell
-pytest
-```
-
-生成单文件 EXE：
-
-```powershell
-.\scripts\build_windows.ps1
-```
-
-输出文件位于 `dist/MB-CF-Optimizer-windows-x64.exe`。
-
-## 发布
-
-推送与项目版本一致的标签会触发 GitHub Actions，例如：
-
-```powershell
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-工作流会先运行测试，再构建 Windows x64 EXE，生成 SHA-256，并将两个文件附加到对应 GitHub Release。应用内更新依赖这两个固定文件名。
-
-## 数据目录
-
-程序数据位于：
-
-```text
-%LOCALAPPDATA%\MB-CF-Optimizer\
-├─ engine\
-└─ updates\
-```
-
-删除该目录可清理已下载的 CFST 引擎和更新缓存。
+[docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md)
 
 ## 许可
 

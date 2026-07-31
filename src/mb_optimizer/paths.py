@@ -6,6 +6,10 @@ from pathlib import Path
 APP_NAME = "MB-CF-Optimizer"
 
 
+def resource_path(name: str) -> Path:
+    return Path(__file__).resolve().parent / "resources" / name
+
+
 def app_data_dir() -> Path:
     if os.name == "nt":
         root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))

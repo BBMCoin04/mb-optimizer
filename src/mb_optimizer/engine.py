@@ -10,6 +10,7 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
+from . import __version__
 from .paths import app_data_dir
 
 ENGINE_VERSION = "v2.3.5"
@@ -63,7 +64,7 @@ class EngineManager:
     def _download(self, target: Path, progress: DownloadProgress | None) -> None:
         request = urllib.request.Request(
             ENGINE_URL,
-            headers={"User-Agent": "MB-CF-Optimizer/0.1"},
+            headers={"User-Agent": f"MB-CF-Optimizer/{__version__}"},
         )
         try:
             with (

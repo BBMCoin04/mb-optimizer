@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .endpoints import DEFAULT_TEST_URL
+
 
 @dataclass(frozen=True, slots=True)
 class CfstResult:
@@ -46,15 +48,16 @@ class AggregatedResult:
 class OptimizationOptions:
     ipv6: bool = False
     port: int = 443
-    test_url: str = "https://cf.xiu2.xyz/url"
+    test_url: str = DEFAULT_TEST_URL
     custom_ip_file: Path | None = None
-    candidate_count: int = 10
-    retest_rounds: int = 3
-    broad_download_count: int = 20
+    broad_candidate_count: int = 800
+    speed_candidate_count: int = 10
+    final_candidate_count: int = 3
+    retest_rounds: int = 2
     threads: int = 200
     ping_count: int = 4
-    max_latency_ms: int = 300
-    max_loss_rate: float = 0.2
+    max_latency_ms: int = 1000
+    max_loss_rate: float = 1.0
     download_seconds: int = 5
 
     def validate(self) -> None:
@@ -64,7 +67,11 @@ class OptimizationOptions:
             raise ValueError("测速地址必须以 http:// 或 https:// 开头")
         if self.custom_ip_file and not self.custom_ip_file.is_file():
             raise ValueError("自定义 IP 文件不存在")
-        if self.candidate_count < 3:
-            raise ValueError("复测候选数量不能少于 3")
-        if self.retest_rounds < 2:
-            raise ValueError("复测轮数不能少于 2")
+        if not 100 <= self.broad_candidate_count <= 5000:
+            raise ValueError("广筛候选数量必须在 100 到 5000 之间")
+        if not 3 <= self.speed_candidate_count <= 30:
+            raise ValueError("测速候选数量必须在 3 到 30 之间")
+        if not 1 <= self.final_candidate_count <= self.speed_candidate_count:
+            raise ValueError("最终候选数量无效")
+        if self.retest_rounds < 1:
+            raise ValueError("复测轮数不能少于 1")
