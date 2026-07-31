@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mb-cf-optimizer"
+version = "0.1.0"
+description = "A focused local Cloudflare IP optimizer for Windows"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "BBMCoin04" }]
+dependencies = ["PySide6-Essentials>=6.8,<7"]
+
+[project.optional-dependencies]
+dev = [
+  "PyInstaller>=6.11,<7",
+  "pytest>=8.3,<9",
+]
+
+[project.gui-scripts]
+mb-cf-optimizer = "mb_optimizer.app:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

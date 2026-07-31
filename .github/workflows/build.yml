@@ -1,0 +1,61 @@
+name: Build Windows release
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+
+      - name: Verify tag matches project version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $Tag = "${{ github.ref_name }}".TrimStart("v")
+          $Version = python -c "from mb_optimizer import __version__; print(__version__)"
+          if ($Tag -ne $Version) {
+            throw "Tag v$Tag does not match application version $Version"
+          }
+
+      - name: Build and test
+        shell: pwsh
+        run: .\scripts\build_windows.ps1
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MB-CF-Optimizer-windows-x64
+          path: |
+            dist/MB-CF-Optimizer-windows-x64.exe
+            dist/MB-CF-Optimizer-windows-x64.exe.sha256
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/MB-CF-Optimizer-windows-x64.exe
+            dist/MB-CF-Optimizer-windows-x64.exe.sha256
