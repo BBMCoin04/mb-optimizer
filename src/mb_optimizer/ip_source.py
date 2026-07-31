@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import random
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -31,26 +32,60 @@ class OfficialIPSource:
     ) -> Path:
         report = status or (lambda _message: None)
         cache = self.root / ("cloudflare-v6.txt" if ipv6 else "cloudflare-v4.txt")
+        snapshots = [
+            cache.with_name(f"{cache.stem}-previous-{index}{cache.suffix}")
+            for index in (1, 2)
+        ]
         if self._fresh(cache, ipv6):
-            report("使用已缓存的官方 IP 段")
+            report(f"使用已缓存的官方 IP 段（{self._cache_age(cache)}）")
             return cache
 
         report("更新 Cloudflare 官方 IP 段")
         try:
             networks = self._download(ipv6)
-            self.root.mkdir(parents=True, exist_ok=True)
-            temporary = cache.with_suffix(".tmp")
-            temporary.write_text("\n".join(networks) + "\n", encoding="utf-8")
-            os.replace(temporary, cache)
+            self._install_cache(cache, snapshots, networks, ipv6)
+            report(f"官方 IP 更新完成（{len(networks)} 个网段）")
             return cache
-        except RuntimeError:
+        except RuntimeError as exc:
+            reason = str(exc)
             if self._valid_file(cache, ipv6):
-                report("官方 IP 更新失败，使用上次缓存")
+                report(f"官方 IP 更新失败，使用旧缓存：{reason}")
                 return cache
+            for index, snapshot in enumerate(snapshots, start=1):
+                if self._valid_file(snapshot, ipv6):
+                    report(f"当前缓存无效，使用历史快照 {index}：{reason}")
+                    return snapshot
             if self._valid_file(fallback, ipv6):
-                report("官方 IP 更新失败，使用内置备用列表")
+                report(f"官方 IP 更新失败，使用内置备用列表：{reason}")
                 return fallback
             raise RuntimeError("无法获取 Cloudflare IP 段，且没有可用缓存") from None
+
+    def _install_cache(
+        self,
+        cache: Path,
+        snapshots: list[Path],
+        networks: list[str],
+        ipv6: bool,
+    ) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        if self._valid_file(snapshots[0], ipv6):
+            temporary_snapshot = snapshots[1].with_suffix(".tmp")
+            shutil.copy2(snapshots[0], temporary_snapshot)
+            os.replace(temporary_snapshot, snapshots[1])
+        if self._valid_file(cache, ipv6):
+            temporary_snapshot = snapshots[0].with_suffix(".tmp")
+            shutil.copy2(cache, temporary_snapshot)
+            os.replace(temporary_snapshot, snapshots[0])
+        temporary = cache.with_suffix(".tmp")
+        temporary.write_text("\n".join(networks) + "\n", encoding="utf-8")
+        os.replace(temporary, cache)
+
+    @staticmethod
+    def _cache_age(path: Path) -> str:
+        age_seconds = max(0, int(time.time() - path.stat().st_mtime))
+        if age_seconds < 3600:
+            return f"{max(1, age_seconds // 60)} 分钟前更新"
+        return f"{age_seconds // 3600} 小时前更新"
 
     @staticmethod
     def _fresh(path: Path, ipv6: bool) -> bool:
@@ -88,7 +123,10 @@ class OfficialIPSource:
             text = body.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise RuntimeError("官方 IP 响应编码无效") from exc
-        return [str(network) for network in _parse_networks(text, ipv6)]
+        networks = [str(network) for network in _parse_networks(text, ipv6)]
+        if len(networks) < 5:
+            raise RuntimeError("官方 IP 响应中的网段数量异常")
+        return networks
 
 
 def sample_candidates(

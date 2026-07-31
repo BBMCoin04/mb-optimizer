@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mb-cf-optimizer"
-version = "0.2.0"
+version = "0.2.5"
 description = "A focused local Cloudflare IP optimizer for Windows"
 readme = "README.md"
 requires-python = ">=3.11"

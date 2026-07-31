@@ -40,4 +40,28 @@ def test_source_uses_bundled_fallback_when_refresh_fails(
     selected = source.get(False, fallback, statuses.append)
 
     assert selected == fallback
-    assert statuses[-1] == "官方 IP 更新失败，使用内置备用列表"
+    assert statuses[-1] == "官方 IP 更新失败，使用内置备用列表：offline"
+
+
+def test_source_recovers_from_historical_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "cache"
+    root.mkdir()
+    (root / "cloudflare-v4.txt").write_text("corrupt\n", encoding="utf-8")
+    snapshot = root / "cloudflare-v4-previous-1.txt"
+    snapshot.write_text("104.16.0.0/13\n", encoding="utf-8")
+    fallback = tmp_path / "fallback.txt"
+    fallback.write_text("172.64.0.0/13\n", encoding="utf-8")
+    source = OfficialIPSource(root)
+    monkeypatch.setattr(
+        source,
+        "_download",
+        lambda _ipv6: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    statuses: list[str] = []
+
+    selected = source.get(False, fallback, statuses.append)
+
+    assert selected == snapshot
+    assert "使用历史快照 1" in statuses[-1]

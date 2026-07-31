@@ -51,13 +51,14 @@ class OptimizationOptions:
     test_url: str = DEFAULT_TEST_URL
     custom_ip_file: Path | None = None
     broad_candidate_count: int = 800
-    speed_candidate_count: int = 10
+    speed_candidate_count: int = 30
+    download_target_count: int = 10
     final_candidate_count: int = 3
     retest_rounds: int = 2
     threads: int = 200
     ping_count: int = 4
-    max_latency_ms: int = 1000
-    max_loss_rate: float = 1.0
+    max_latency_ms: int = 300
+    max_loss_rate: float = 0.25
     download_seconds: int = 5
 
     def validate(self) -> None:
@@ -69,8 +70,10 @@ class OptimizationOptions:
             raise ValueError("自定义 IP 文件不存在")
         if not 100 <= self.broad_candidate_count <= 5000:
             raise ValueError("广筛候选数量必须在 100 到 5000 之间")
-        if not 3 <= self.speed_candidate_count <= 30:
-            raise ValueError("测速候选数量必须在 3 到 30 之间")
+        if not 3 <= self.speed_candidate_count <= 100:
+            raise ValueError("测速候选数量必须在 3 到 100 之间")
+        if not 1 <= self.download_target_count <= 100:
+            raise ValueError("下载测速目标数量必须在 1 到 100 之间")
         if not 1 <= self.final_candidate_count <= self.speed_candidate_count:
             raise ValueError("最终候选数量无效")
         if self.retest_rounds < 1:

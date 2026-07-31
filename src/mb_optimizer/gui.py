@@ -1,23 +1,26 @@
 from __future__ import annotations
 
-import csv
 import sys
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (
     QElapsedTimer,
     QObject,
     QSettings,
+    QStandardPaths,
     Qt,
     QThread,
+    QUrl,
     QTimer,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QCloseEvent, QGuiApplication
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QButtonGroup,
     QComboBox,
@@ -45,7 +48,12 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .endpoints import DEFAULT_TEST_URL, TEST_URL_PRESETS
+from .endpoints import (
+    CLOUDFLARE_SPEED_URL,
+    DEFAULT_TEST_URL,
+    TEST_URL_PRESETS,
+)
+from .exporter import timestamped_result_path, write_results_csv
 from .models import AggregatedResult, OptimizationOptions
 from .optimizer import OptimizationService
 from .runner import CfstCancelled
@@ -67,12 +75,14 @@ class OptimizationWorker(QObject):
     cancelled = Signal()
     status_changed = Signal(str, int)
     log_added = Signal(str)
+    endpoint_selected = Signal(str)
 
     def __init__(self, options: OptimizationOptions) -> None:
         super().__init__()
         self.service = OptimizationService(
             status=self.status_changed.emit,
             log=self.log_added.emit,
+            endpoint_selected=self.endpoint_selected.emit,
         )
         self.options = options
 
@@ -136,8 +146,11 @@ class MainWindow(QMainWindow):
         self.update_thread: QThread | None = None
         self.update_worker: QObject | None = None
         self.pending_update_info: UpdateInfo | None = None
+        self.latest_result_path: Path | None = None
+        self.network_mode = "用户确认直连"
         self.current_status_message = "就绪"
         self.run_clock = QElapsedTimer()
+        self.progress_update_clock = QElapsedTimer()
         self.elapsed_tick = QTimer(self)
         self.elapsed_tick.setInterval(1000)
         self.elapsed_tick.timeout.connect(self._refresh_elapsed_status)
@@ -145,14 +158,15 @@ class MainWindow(QMainWindow):
         self.previous_splitter_sizes = [500, 180]
 
         self.setWindowTitle(f"MB CF Optimizer {__version__}")
-        self.setMinimumSize(940, 680)
-        self.resize(1120, 780)
+        self.setMinimumSize(880, 680)
+        self.resize(934, 780)
         self._build_ui()
         self._apply_style()
         self._load_settings()
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("central")
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(24, 20, 24, 20)
@@ -212,6 +226,7 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("端口"), 0, 2)
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65535)
+        self.port_input.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.port_input.setValue(443)
         form.addWidget(self.port_input, 0, 3)
 
@@ -222,7 +237,7 @@ class MainWindow(QMainWindow):
         for label, url in TEST_URL_PRESETS:
             self.url_input.addItem(label, url)
         self.url_input.setEditText(DEFAULT_TEST_URL)
-        self.url_input.lineEdit().setClearButtonEnabled(True)
+        self.url_input.lineEdit().setClearButtonEnabled(False)
         self.url_input.activated.connect(
             lambda index: self.url_input.setEditText(self.url_input.itemData(index))
         )
@@ -269,19 +284,22 @@ class MainWindow(QMainWindow):
         self.latency_input = QSpinBox()
         self.latency_input.setRange(50, 2000)
         self.latency_input.setSuffix(" ms")
-        self.latency_input.setValue(1000)
+        self.latency_input.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.latency_input.setValue(300)
         filter_layout.addWidget(self.latency_input, 0, 1)
         filter_layout.addWidget(QLabel("丢包上限"), 0, 2)
         self.loss_input = QDoubleSpinBox()
         self.loss_input.setRange(0, 100)
         self.loss_input.setSuffix(" %")
         self.loss_input.setDecimals(0)
-        self.loss_input.setValue(100)
+        self.loss_input.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.loss_input.setValue(25)
         filter_layout.addWidget(self.loss_input, 0, 3)
         filter_layout.addWidget(QLabel("广筛数量"), 0, 4)
         self.broad_count_input = QSpinBox()
         self.broad_count_input.setRange(100, 5000)
         self.broad_count_input.setSingleStep(100)
+        self.broad_count_input.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.broad_count_input.setValue(800)
         filter_layout.addWidget(self.broad_count_input, 0, 5)
         filter_layout.setColumnStretch(6, 1)
@@ -306,7 +324,14 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.start_button)
         actions.addWidget(self.stop_button)
         actions.addStretch()
-        self.export_button = QPushButton("导出 CSV")
+        self.open_result_button = QPushButton("打开结果文件夹")
+        self.open_result_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)
+        )
+        self.open_result_button.setEnabled(False)
+        self.open_result_button.clicked.connect(self._open_result_folder)
+        actions.addWidget(self.open_result_button)
+        self.export_button = QPushButton("另存为")
         self.export_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
         )
@@ -381,6 +406,12 @@ class MainWindow(QMainWindow):
         self.log_toggle.setArrowType(Qt.ArrowType.RightArrow)
         self.log_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.log_toggle.toggled.connect(self._toggle_log)
+        self.copy_log_button = QPushButton("复制日志")
+        self.copy_log_button.setToolTip("复制全部诊断日志")
+        self.copy_log_button.clicked.connect(self._copy_log)
+        self.save_log_button = QPushButton("保存日志")
+        self.save_log_button.setToolTip("保存诊断日志文件")
+        self.save_log_button.clicked.connect(self._save_log)
         self.expand_log_button = QPushButton()
         self.expand_log_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton)
@@ -390,11 +421,13 @@ class MainWindow(QMainWindow):
         self.expand_log_button.clicked.connect(self._toggle_log_expanded)
         log_header.addWidget(self.log_toggle)
         log_header.addStretch()
+        log_header.addWidget(self.copy_log_button)
+        log_header.addWidget(self.save_log_button)
         log_header.addWidget(self.expand_log_button)
         log_layout.addLayout(log_header)
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
-        self.log_output.setMaximumBlockCount(500)
+        self.log_output.setMaximumBlockCount(2000)
         self.log_output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.log_output.setMinimumHeight(100)
         self.log_output.setVisible(False)
@@ -408,30 +441,34 @@ class MainWindow(QMainWindow):
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background: #e9eff1; color: #18212b; }
+            QMainWindow, QWidget#central { background: #c5cbd0; }
+            QWidget { color: #18212b; }
+            QLabel { background: transparent; }
+            QDialog, QMessageBox { background: #cbd1d5; color: #18212b; }
+            QDialog QLabel, QMessageBox QLabel { background: transparent; color: #18212b; }
             QLabel#title { font-size: 22px; font-weight: 700; color: #111827; }
-            QLabel#muted { color: #667085; }
+            QLabel#muted { color: #53606c; }
             QLabel#status { color: #344054; font-weight: 600; }
-            QFrame#panel { background: #f6f9f9; border: 1px solid #cbd6da; border-radius: 6px; }
-            QFrame#summary { background: #eef8f4; border: 1px solid #9bd5c3; border-radius: 6px; }
+            QFrame#panel { background: #d4dade; border: 1px solid #aab5ba; border-radius: 6px; }
+            QFrame#summary { background: #d8e5e1; border: 1px solid #80b7a6; border-radius: 6px; }
             QLabel#summaryCaption { color: #08785e; font-weight: 700; }
             QLabel#bestIp { font-size: 16px; font-weight: 700; color: #12382f; }
-            QPushButton, QToolButton { min-height: 32px; padding: 0 12px; background: #f5f8f8; border: 1px solid #bcc9ce; border-radius: 5px; }
-            QPushButton:hover, QToolButton:hover { background: #edf3f4; border-color: #8fa1a8; }
-            QPushButton:disabled { color: #98a2b3; background: #eef1f4; border-color: #d8dee6; }
+            QPushButton, QToolButton { min-height: 32px; padding: 0 12px; background: #dce1e4; border: 1px solid #9eabb1; border-radius: 5px; }
+            QPushButton:hover, QToolButton:hover { background: #d1d8dc; border-color: #778b94; }
+            QPushButton:disabled { color: #7f8992; background: #cfd5d8; border-color: #b9c2c6; }
             QPushButton#primary { color: #ffffff; background: #0f766e; border-color: #0f766e; font-weight: 700; min-width: 112px; }
             QPushButton#primary:hover { background: #0b665f; }
-            QPushButton#danger { color: #9b2c2c; background: #fff7f7; border-color: #e3b5b5; min-width: 82px; }
+            QPushButton#danger { color: #8c2f2f; background: #eadede; border-color: #cfa8a8; min-width: 82px; }
             QPushButton#segment { border-radius: 0; min-height: 30px; }
             QPushButton#segment:first { border-top-left-radius: 5px; border-bottom-left-radius: 5px; }
             QPushButton#segment:checked { color: #ffffff; background: #344054; border-color: #344054; }
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 32px; background: #fbfcfc; border: 1px solid #bcc9ce; border-radius: 4px; padding: 0 8px; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 32px; background: #e3e7e9; border: 1px solid #9eabb1; border-radius: 4px; padding: 0 8px; }
             QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #2f80a3; }
-            QComboBox QAbstractItemView { background: #fbfcfc; border: 1px solid #bcc9ce; selection-background-color: #dcecef; }
+            QComboBox QAbstractItemView { background: #e3e7e9; border: 1px solid #9eabb1; selection-background-color: #c5d9de; }
             QProgressBar { height: 8px; background: #dfe5eb; border: 0; border-radius: 4px; }
             QProgressBar::chunk { background: #159a80; border-radius: 4px; }
-            QTableWidget { background: #f7f9fa; alternate-background-color: #edf2f3; border: 1px solid #cbd6da; border-radius: 4px; gridline-color: #dce4e7; selection-background-color: #d4e7eb; selection-color: #18212b; }
-            QHeaderView::section { background: #dfe8ea; color: #344054; padding: 8px; border: 0; border-right: 1px solid #cbd6da; font-weight: 600; }
+            QTableWidget { background: #dfe4e6; alternate-background-color: #d4dade; border: 1px solid #aab5ba; border-radius: 4px; gridline-color: #bec8cc; selection-background-color: #bad2d8; selection-color: #18212b; }
+            QHeaderView::section { background: #cbd3d7; color: #344054; padding: 8px; border: 0; border-right: 1px solid #aab5ba; font-weight: 600; }
             QSplitter::handle { background: #c5d1d5; height: 5px; }
             QPlainTextEdit { background: #151b22; color: #d6dde5; border: 1px solid #303944; border-radius: 4px; padding: 8px; font-family: Consolas; }
             """
@@ -441,13 +478,18 @@ class MainWindow(QMainWindow):
         schema = self.settings.value("settings_schema", 0, int)
         self.port_input.setValue(self.settings.value("port", 443, int))
         if schema >= 2:
-            self.url_input.setEditText(
-                self.settings.value("test_url", DEFAULT_TEST_URL, str)
-            )
-            self.latency_input.setValue(self.settings.value("max_latency", 1000, int))
-            self.loss_input.setValue(
-                self.settings.value("max_loss_percent", 100, float)
-            )
+            saved_url = self.settings.value("test_url", DEFAULT_TEST_URL, str)
+            if schema < 4 and saved_url == CLOUDFLARE_SPEED_URL:
+                saved_url = DEFAULT_TEST_URL
+            self.url_input.setEditText(saved_url)
+            latency = self.settings.value("max_latency", 300, int)
+            loss = self.settings.value("max_loss_percent", 25, float)
+            if schema < 4 and latency == 1000:
+                latency = 300
+            if schema < 4 and loss == 100:
+                loss = 25
+            self.latency_input.setValue(latency)
+            self.loss_input.setValue(loss)
             self.broad_count_input.setValue(
                 self.settings.value("broad_candidate_count", 800, int)
             )
@@ -455,7 +497,7 @@ class MainWindow(QMainWindow):
             self.ipv6_button.setChecked(True)
 
     def _save_settings(self) -> None:
-        self.settings.setValue("settings_schema", 2)
+        self.settings.setValue("settings_schema", 4)
         self.settings.setValue("test_url", self.url_input.currentText().strip())
         self.settings.setValue("port", self.port_input.value())
         self.settings.setValue("max_latency", self.latency_input.value())
@@ -530,6 +572,15 @@ class MainWindow(QMainWindow):
     def _start_optimization(self) -> None:
         if self.optimize_thread:
             return
+        answer = QMessageBox.question(
+            self,
+            "确认直连网络",
+            "请先关闭 OpenClash、PassWall、TUN 等透明代理，并在本轮测速中保持网络路由不变。\n\n确认当前电脑已直连后继续。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         options = self._options()
         try:
             options.validate()
@@ -539,6 +590,8 @@ class MainWindow(QMainWindow):
 
         self._save_settings()
         self.results = []
+        self.latest_result_path = None
+        self.open_result_button.setEnabled(False)
         self.table.setRowCount(0)
         self.summary.setVisible(False)
         self.log_output.clear()
@@ -553,6 +606,7 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.status_changed.connect(self._set_status)
         worker.log_added.connect(self.log_output.appendPlainText)
+        worker.endpoint_selected.connect(self._endpoint_selected)
         worker.finished.connect(self._optimization_finished)
         worker.failed.connect(self._optimization_failed)
         worker.cancelled.connect(self._optimization_cancelled)
@@ -576,7 +630,14 @@ class MainWindow(QMainWindow):
     def _set_status(self, message: str, progress: int) -> None:
         self.current_status_message = message
         self._refresh_elapsed_status()
-        self.progress.setValue(progress)
+        if progress < 0:
+            self.progress_update_clock.invalidate()
+            self.progress.setRange(0, 0)
+        else:
+            self.progress_update_clock.start()
+            if self.progress.maximum() == 0:
+                self.progress.setRange(0, 100)
+            self.progress.setValue(progress)
 
     def _refresh_elapsed_status(self) -> None:
         if self.elapsed_tick.isActive() and self.run_clock.isValid():
@@ -584,18 +645,61 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 f"{self.current_status_message} · 已用 {seconds // 60:02d}:{seconds % 60:02d}"
             )
+            if (
+                self.progress.maximum() != 0
+                and self.progress_update_clock.isValid()
+                and self.progress_update_clock.elapsed() >= 8000
+            ):
+                self.progress_update_clock.invalidate()
+                self.progress.setRange(0, 0)
         else:
             self.status_label.setText(self.current_status_message)
+
+    @Slot(str)
+    def _endpoint_selected(self, url: str) -> None:
+        self.url_input.setEditText(url)
+        self.settings.setValue("test_url", url)
 
     @Slot(object)
     def _optimization_finished(self, results: object) -> None:
         self.results = list(results)
         self._populate_results()
+        export_error: str | None = None
+        try:
+            desktop = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DesktopLocation
+            )
+            destination = timestamped_result_path(Path(desktop or Path.home()))
+            write_results_csv(
+                destination,
+                self.results,
+                self.network_mode,
+                self.url_input.currentText().strip(),
+            )
+            self.latest_result_path = destination
+            self.open_result_button.setEnabled(True)
+            elapsed = self.run_clock.elapsed() // 1000
+            self.log_output.appendPlainText(
+                f"[{elapsed // 60:02d}:{elapsed % 60:02d}] [INFO] 最终结果已保存：{destination}"
+            )
+            self.current_status_message = f"优选完成 · 已保存 {destination.name}"
+        except OSError as exc:
+            export_error = str(exc)
+            self.current_status_message = "优选完成 · 自动保存失败"
         self._set_running(False)
+        self._refresh_elapsed_status()
+        if export_error:
+            QMessageBox.warning(
+                self,
+                "自动保存失败",
+                f"优选已经完成，但无法自动保存到桌面：\n{export_error}\n\n请使用“另存为”。",
+            )
 
     @Slot(str)
     def _optimization_failed(self, message: str) -> None:
         self.current_status_message = "优选失败"
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         self._set_running(False)
         self._refresh_elapsed_status()
         QMessageBox.critical(self, "优选失败", message)
@@ -603,6 +707,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _optimization_cancelled(self) -> None:
         self.current_status_message = "已停止"
+        self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self._set_running(False)
         self._refresh_elapsed_status()
@@ -618,6 +723,7 @@ class MainWindow(QMainWindow):
         if running:
             self.current_status_message = "准备开始"
             self.run_clock.start()
+            self.progress_update_clock.invalidate()
             self.elapsed_tick.start()
             self._refresh_elapsed_status()
         else:
@@ -668,7 +774,7 @@ class MainWindow(QMainWindow):
         best = self.results[0]
         self.best_label.setText(best.ip)
         self.best_detail.setText(
-            f"{best.median_speed_mb_s:.2f} MB/s  ·  {best.median_latency_ms:.1f} ms  ·  成功率 {best.success_rate:.0%}"
+            f"{best.median_speed_mb_s:.2f} MB/s  ·  {best.median_latency_ms:.1f} ms  ·  成功率 {best.success_rate:.0%}  ·  {self.network_mode}"
         )
         self.summary.setVisible(True)
         self.export_button.setEnabled(True)
@@ -688,42 +794,47 @@ class MainWindow(QMainWindow):
     def _export_csv(self) -> None:
         if not self.results:
             return
+        initial = self.latest_result_path.name if self.latest_result_path else "mb-cf-results.csv"
         filename, _ = QFileDialog.getSaveFileName(
-            self, "导出优选结果", "mb-cf-results.csv", "CSV 文件 (*.csv)"
+            self, "另存优选结果", initial, "CSV 文件 (*.csv)"
         )
         if not filename:
             return
-        with Path(filename).open("w", encoding="utf-8-sig", newline="") as output:
-            writer = csv.writer(output)
-            writer.writerow(
-                [
-                    "推荐",
-                    "IP",
-                    "地区",
-                    "成功率",
-                    "丢包率",
-                    "速度(MB/s)",
-                    "延迟(ms)",
-                    "波动(ms)",
-                ]
+        try:
+            write_results_csv(
+                Path(filename),
+                self.results,
+                self.network_mode,
+                self.url_input.currentText().strip(),
             )
-            for index, result in enumerate(self.results):
-                recommendation = (
-                    "首选" if index == 0 else f"备用 {index}" if index <= 3 else ""
-                )
-                writer.writerow(
-                    [
-                        recommendation,
-                        result.ip,
-                        result.region,
-                        f"{result.success_rate:.0%}",
-                        f"{result.median_loss_rate:.0%}",
-                        f"{result.median_speed_mb_s:.2f}",
-                        f"{result.median_latency_ms:.1f}",
-                        f"{result.latency_jitter_ms:.1f}",
-                    ]
-                )
-        self.status_label.setText("结果已导出")
+        except OSError as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self.status_label.setText("结果已另存")
+
+    def _open_result_folder(self) -> None:
+        if self.latest_result_path:
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(self.latest_result_path.parent))
+            )
+
+    def _copy_log(self) -> None:
+        QGuiApplication.clipboard().setText(self.log_output.toPlainText())
+        self.status_label.setText("已复制诊断日志")
+
+    def _save_log(self) -> None:
+        default_name = f"MB-CF-Optimizer-diagnostic-{datetime.now():%Y%m%d-%H%M%S}.log"
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "保存诊断日志", default_name, "日志文件 (*.log);;文本文件 (*.txt)"
+        )
+        if not filename:
+            return
+        try:
+            Path(filename).write_text(self.log_output.toPlainText(), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self.status_label.setText("诊断日志已保存")
 
     def _check_update(self) -> None:
         if self.update_thread:
